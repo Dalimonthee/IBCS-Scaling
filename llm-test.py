@@ -24,7 +24,7 @@ def _tqdm_write(s: str, *, file=None, end="\n", nolock=False, **kwargs: Any) -> 
 # Gemini API (free tier): https://ai.google.dev/gemini-api/docs/quickstart
 # Rate limits (RPM, TPM, RPD) are per project; see https://ai.google.dev/gemini-api/docs/rate-limits
 # and your caps in AI Studio: https://aistudio.google.com/rate-limit
-# Default client throttle targets ~4 RPM (sliding 60s window + min gap); override via GEMINI_MAX_RPM /
+# Default client throttle targets ~5 RPM (sliding 60s window + min gap); override via GEMINI_MAX_RPM /
 # GEMINI_MIN_INTERVAL_SEC if your quota allows more.
 
 IMAGE_DIR = Path("./dashboards")
