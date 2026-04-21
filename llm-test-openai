@@ -1,0 +1,1116 @@
+#!/usr/bin/env python3
+import base64
+import json
+import mimetypes
+import os
+import random
+import sys
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable
+
+from tqdm import tqdm
+
+try:
+    from openai import OpenAI
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Missing dependency: openai. Install it first, e.g.:\n"
+        "  pip install openai\n"
+        "or add it to requirements.txt.\n"
+        f"Import error: {exc}"
+    ) from exc
+
+
+# Some environments patch `print` to route through `tqdm.write`, which does not accept `flush=`.
+def _tqdm_write(s: str, *, file=None, end="\n", nolock=False, **kwargs: Any) -> None:
+    kwargs.pop("flush", None)
+    tqdm.write(s, file=file, end=end, nolock=nolock)
+
+
+IMAGE_DIR = Path(
+    os.environ.get(
+        "OPENAI_IMAGE_DIR",
+        "/Users/nguyenanhvu/Documents/AMD-Semester3/GroupProject/IBCS-Scaling/Dataset",
+    )
+)
+OUTPUT_FILE = Path("ibcs_compliance_report_openai.json")
+COMPLIANCE_CHARTS_FILE = Path("ibcs_compliance_charts.png")
+SEED = 42
+
+MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "8192"))
+TEMPERATURE = 0.1
+TOP_P = 0.9
+
+DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-5-mini"
+
+_DEFAULT_TARGET_RPM = int(os.environ.get("OPENAI_MAX_RPM", "4"))
+DEFAULT_MIN_INTERVAL_SEC = float(
+    os.environ.get("OPENAI_MIN_INTERVAL_SEC", str(60.0 / max(1, _DEFAULT_TARGET_RPM)))
+)
+DEFAULT_MAX_REQUESTS_PER_MINUTE = max(1, _DEFAULT_TARGET_RPM)
+OPENAI_POST_REQUEST_PAUSE_SEC = float(os.environ.get("OPENAI_POST_REQUEST_PAUSE_SEC", "0.5"))
+
+AUDIT_RUNS_PER_IMAGE = int(os.environ.get("OPENAI_AUDIT_RUNS", "1"))
+
+HTTP_TIMEOUT_SEC = float(os.environ.get("OPENAI_HTTP_TIMEOUT_SEC", "600"))
+MAX_RETRIES = 8
+MAX_TIMEOUT_RETRIES = 3
+INITIAL_BACKOFF_SEC = 2.0
+
+IMAGE_MAX_EDGE = int(os.environ.get("OPENAI_IMAGE_MAX_EDGE", "2048"))
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+SYSTEM_PROMPT = """
+You are an expert in IBCS (International Business Communication Standards) focused ONLY on these 4 checks:
+1) axis_baseline
+2) consistent_scaling
+3) zoom_requirement
+4) labelling
+
+You must be conservative. If you cannot verify something from the image, say "unknown" and do NOT turn uncertainty into a violation.
+
+General reading permissions:
+- Read and use chart titles, subtitles, units, legends, and callouts. Titles often change meaning (e.g., Sales vs Cost).
+- Use color meaning only when the legend/title implies it (e.g., green=good/red=bad for KPI deltas). Do NOT assume a universal color meaning.
+
+RULE DEFINITIONS (tight, non-overreaching)
+
+RULE axis_baseline:
+- Only applies when a quantitative axis is present OR when baseline is explicitly implied (e.g., y-axis with ticks, numeric scale, or clear baseline markers).
+- If there is NO visible quantitative axis (no ticks/scale), treat baseline as "unknown" (NOT a violation). Do not infer truncation from bar heights alone.
+- Violation only if you can clearly see a non-zero baseline/truncated axis AND it is not justified in the chart.
+
+RULE consistent_scaling:
+- Only evaluate between charts that are truly comparable:
+  - same metric + same unit (e.g., revenue USD vs revenue USD; margin % vs margin %), OR explicitly stated as directly comparable in titles/legend.
+  - Do NOT treat percent (%) vs absolute values (USD, K, units) as requiring a shared scale.
+  - Do NOT compare scales across charts that are different concepts even if they share a unit (e.g., Sales ΔPL% vs Cost ΔPL% are different business concepts; color semantics may differ).
+- Only flag a violation if:
+  - comparable charts have visible quantitative axes AND the axis ranges/intervals differ, OR
+  - the chart explicitly indicates a shared scale requirement but scales differ.
+- If axis information is not readable (blur/low-res), mark this rule as "unknown", not a violation.
+
+RULE zoom_requirement:
+- Only applies when the chart is intended for precise visual comparison AND differences are too small to read at the shown scale.
+- Distinguish:
+  - "blur_or_unreadable": image quality prevents reading values/ticks → mark unknown, not a zoom violation.
+  - "zoom_needed": values/ticks are readable but differences are compressed so comparisons are not visually discernible AND there is no inset/callout/secondary zoom view.
+- Do NOT flag zoom_requirement if a zoomed-in panel/inset/callout is already present.
+
+RULE labelling:
+- This check is ONLY about whether the chart provides adequate numeric labeling for interpretation (values may be inside, above, or as callouts).
+- Do NOT require consistent placement/format across multiple charts.
+- It is NOT a violation if some values are inside and some are outside, as long as the key data are readable/understandable.
+- Violation only if numeric values are necessary to interpret the chart AND they are missing/illegible for the relevant marks.
+
+Compliance decision:
+- A dashboard is non-compliant if ANY violation has confidence >= 0.6.
+- Violations with confidence < 0.6 must be listed but do NOT change the compliant flag; set low_confidence=true.
+
+Output STRICTLY as JSON (no markdown, no extra text):
+{
+  "compliant": true/false/null,
+  "noncompliance_score": 0.0-1.0,
+  "rule_checks": {
+    "axis_baseline": {"status": "pass|fail|unknown|not_applicable", "evidence": "short"},
+    "consistent_scaling": {"status": "pass|fail|unknown|not_applicable", "evidence": "short"},
+    "zoom_requirement": {"status": "pass|fail|unknown|not_applicable", "evidence": "short"},
+    "labelling": {"status": "pass|fail|unknown|not_applicable", "evidence": "short"}
+  },
+  "violations": [
+    {
+      "rule": "axis_baseline|consistent_scaling|zoom_requirement|labelling",
+      "description": "clear explanation",
+      "charts_involved": ["chart_1", "chart_2"],
+      "confidence": 0.0-1.0,
+      "low_confidence": true/false
+    }
+  ],
+  "charts_detected": [
+    {
+      "id": "chart_1",
+      "type": "bar/line/other",
+      "position": "top-left / top-right / etc.",
+      "unit": "%|USD|unknown|...",
+      "starts_at_zero": true/false/unknown,
+      "estimated_range": [min, max] or null,
+      "related_to": ["chart_2", "chart_3"],
+      "notes": "short reasoning"
+    }
+  ],
+  "final_explanation": "short explanation"
+}
+Hard constraints:
+- If unsure, use unknown and set low confidence; do not guess exact values.
+- Only return valid JSON (double quotes, no trailing commas).
+""".strip()
+
+
+def _load_ground_truth(path: Path) -> dict[str, bool]:
+    """
+    Optional labels for evaluation metrics.
+    Accepted formats:
+    - CSV with header: filename,label  where label is compliant/noncompliant/true/false/1/0
+    - JSON object: { "file.png": true, ... }  (true=compliant, false=non-compliant)
+    """
+    if not path.exists() or not path.is_file():
+        return {}
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            out: dict[str, bool] = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, bool):
+                    out[k] = v
+            return out
+        return {}
+    # CSV fallback
+    text = path.read_text(encoding="utf-8").strip().splitlines()
+    if not text:
+        return {}
+    rows = [r.strip() for r in text if r.strip()]
+    if not rows:
+        return {}
+    header = [h.strip().lower() for h in rows[0].split(",")]
+    try:
+        i_fn = header.index("filename")
+        i_lb = header.index("label")
+    except ValueError:
+        return {}
+    out: dict[str, bool] = {}
+    for r in rows[1:]:
+        parts = [p.strip() for p in r.split(",")]
+        if len(parts) <= max(i_fn, i_lb):
+            continue
+        fn = parts[i_fn]
+        lb = parts[i_lb].lower()
+        if not fn:
+            continue
+        if lb in {"compliant", "true", "1", "yes", "y"}:
+            out[fn] = True
+        elif lb in {"noncompliant", "non-compliant", "false", "0", "no", "n"}:
+            out[fn] = False
+    return out
+
+
+def _confusion_matrix(y_true: list[int], y_pred: list[int]) -> dict[str, int]:
+    # positive class = non-compliant (1)
+    tp = sum(1 for t, p in zip(y_true, y_pred, strict=False) if t == 1 and p == 1)
+    tn = sum(1 for t, p in zip(y_true, y_pred, strict=False) if t == 0 and p == 0)
+    fp = sum(1 for t, p in zip(y_true, y_pred, strict=False) if t == 0 and p == 1)
+    fn = sum(1 for t, p in zip(y_true, y_pred, strict=False) if t == 1 and p == 0)
+    return {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
+
+
+def _classification_report(cm: dict[str, int]) -> dict[str, float]:
+    tp, tn, fp, fn = cm["tp"], cm["tn"], cm["fp"], cm["fn"]
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0.0
+    return {
+        "accuracy": acc,
+        "precision_noncompliant": precision,
+        "recall_noncompliant": recall,
+        "f1_noncompliant": f1,
+    }
+
+
+def _pr_curve(y_true: list[int], y_score: list[float]) -> tuple[list[float], list[float], float]:
+    """
+    Precision-recall curve for positive class=1.
+    Returns (precision_points, recall_points, auc_pr).
+    """
+    pairs = sorted(zip(y_score, y_true, strict=False), key=lambda x: x[0], reverse=True)
+    if not pairs:
+        return [], [], 0.0
+    p_total = sum(1 for _, t in pairs if t == 1)
+    if p_total == 0:
+        return [1.0], [0.0], 0.0
+    tp = fp = 0
+    precisions: list[float] = []
+    recalls: list[float] = []
+    last_score: float | None = None
+    for score, t in pairs:
+        if last_score is None or score != last_score:
+            if tp + fp > 0:
+                precisions.append(tp / (tp + fp))
+                recalls.append(tp / p_total)
+            last_score = score
+        if t == 1:
+            tp += 1
+        else:
+            fp += 1
+    precisions.append(tp / (tp + fp) if (tp + fp) else 1.0)
+    recalls.append(tp / p_total)
+
+    # AUC via trapezoidal integral over recall (x) vs precision (y)
+    auc = 0.0
+    for i in range(1, len(recalls)):
+        x0, x1 = recalls[i - 1], recalls[i]
+        y0, y1 = precisions[i - 1], precisions[i]
+        auc += (x1 - x0) * (y0 + y1) / 2.0
+    return precisions, recalls, auc
+
+
+@dataclass
+class AuditConfig:
+    model: str = DEFAULT_OPENAI_MODEL
+    image_dir: Path = IMAGE_DIR
+    output_file: Path = OUTPUT_FILE
+    compliance_charts_file: Path = COMPLIANCE_CHARTS_FILE
+    seed: int = SEED
+    max_output_tokens: int = MAX_OUTPUT_TOKENS
+    temperature: float = TEMPERATURE
+    top_p: float = TOP_P
+    min_interval_sec: float = DEFAULT_MIN_INTERVAL_SEC
+    max_requests_per_minute: int = DEFAULT_MAX_REQUESTS_PER_MINUTE
+    post_request_pause_sec: float = OPENAI_POST_REQUEST_PAUSE_SEC
+    http_timeout_sec: float = HTTP_TIMEOUT_SEC
+    audit_runs_per_image: int = AUDIT_RUNS_PER_IMAGE
+    api_key: str | None = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY"))
+
+    def __post_init__(self) -> None:
+        self.min_interval_sec = max(0.0, float(self.min_interval_sec))
+        self.max_requests_per_minute = max(1, int(self.max_requests_per_minute))
+        self.post_request_pause_sec = max(0.0, float(self.post_request_pause_sec))
+        self.audit_runs_per_image = max(1, int(self.audit_runs_per_image))
+        self.max_output_tokens = max(1, int(self.max_output_tokens))
+        self.model = (self.model or "").strip() or DEFAULT_OPENAI_MODEL
+
+
+class RateLimiter:
+    """Enforces a minimum gap between calls and a sliding-window RPM cap."""
+
+    def __init__(self, min_interval_sec: float, max_requests_per_minute: int) -> None:
+        self._min_interval = max(0.0, min_interval_sec)
+        self._max_rpm = max(0, max_requests_per_minute)
+        self._lock = threading.Lock()
+        self._last_call_monotonic: float = 0.0
+        self._call_times: list[float] = []
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self._min_interval > 0:
+                elapsed = now - self._last_call_monotonic
+                if elapsed < self._min_interval:
+                    time.sleep(self._min_interval - elapsed)
+                    now = time.monotonic()
+
+            if self._max_rpm > 0:
+                window_start = now - 60.0
+                self._call_times = [t for t in self._call_times if t > window_start]
+                if len(self._call_times) >= self._max_rpm:
+                    sleep_until = self._call_times[0] + 60.0 - now
+                    if sleep_until > 0:
+                        time.sleep(sleep_until)
+                        now = time.monotonic()
+                        window_start = now - 60.0
+                        self._call_times = [t for t in self._call_times if t > window_start]
+
+            self._call_times.append(time.monotonic())
+            self._last_call_monotonic = self._call_times[-1]
+
+
+def set_reproducible_seed(seed: int) -> None:
+    random.seed(seed)
+
+
+def validate_image_dir(image_dir: Path) -> None:
+    if not image_dir.exists():
+        raise FileNotFoundError(
+            f"Image directory not found: {image_dir.resolve()}. "
+            "Create it and add dashboard images before running the script."
+        )
+    if not image_dir.is_dir():
+        raise NotADirectoryError(f"Expected a directory but got: {image_dir.resolve()}")
+
+
+def get_image_paths(image_dir: Path) -> list[Path]:
+    validate_image_dir(image_dir)
+    # Recursive so `Dataset/Compliant` and `Dataset/Not Compliant` both work.
+    image_paths = sorted(
+        path
+        for path in image_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            f"No supported images found in {image_dir.resolve()}. "
+            f"Supported extensions: {', '.join(sorted(IMAGE_EXTENSIONS))}"
+        )
+    return image_paths
+
+
+def _guess_mime(image_path: Path) -> str:
+    mime, _ = mimetypes.guess_type(image_path.name)
+    if mime:
+        return mime
+    ext = image_path.suffix.lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+
+
+def _image_bytes_for_api(image_path: Path) -> tuple[bytes, str]:
+    """
+    Return (raw_bytes, mime). Optionally downscale with Pillow to keep
+    multimodal requests smaller and faster.
+    """
+    mime = _guess_mime(image_path)
+    if IMAGE_MAX_EDGE <= 0:
+        return image_path.read_bytes(), mime
+
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except ImportError:
+        return image_path.read_bytes(), mime
+
+    with Image.open(image_path) as im:
+        if im.mode in ("RGBA", "P"):
+            im = im.convert("RGB")
+        elif im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        w, h = im.size
+        longest = max(w, h)
+        if longest > IMAGE_MAX_EDGE:
+            scale = IMAGE_MAX_EDGE / longest
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS  # type: ignore[attr-defined]
+            im = im.resize((new_w, new_h), resample)
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=88, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+
+
+def _data_url_from_bytes(raw: bytes, mime: str) -> str:
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def extract_json_block(response_text: str) -> str:
+    cleaned = response_text.strip()
+    if "```json" in cleaned:
+        return cleaned.split("```json", maxsplit=1)[1].split("```", maxsplit=1)[0].strip()
+    if "```" in cleaned:
+        return cleaned.split("```", maxsplit=1)[1].split("```", maxsplit=1)[0].strip()
+    return cleaned
+
+
+def extract_balanced_json_object(s: str) -> str | None:
+    """First top-level `{ ... }` with string-aware brace matching."""
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+def parse_audit_json(text: str) -> dict[str, Any]:
+    """Try fenced block, full text, then balanced-brace extraction."""
+    candidates: list[str] = []
+    for part in (extract_json_block(text), text.strip()):
+        if part and part not in candidates:
+            candidates.append(part)
+    bal = extract_balanced_json_object(text)
+    if bal and bal not in candidates:
+        candidates.append(bal)
+    last_err: json.JSONDecodeError | None = None
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            data = json.loads(cand)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError as exc:
+            last_err = exc
+    if last_err is not None:
+        raise last_err
+    raise json.JSONDecodeError("No JSON object found in model output", text, 0)
+
+
+def _with_heartbeat(label: str, fn: Callable[[], Any]) -> Any:
+    """Run fn() in a thread; print a line every ~30s until it returns."""
+    done = threading.Event()
+    err: list[BaseException] = []
+    out: list[Any] = []
+
+    def worker() -> None:
+        try:
+            out.append(fn())
+        except BaseException as e:
+            err.append(e)
+        finally:
+            done.set()
+
+    def heartbeat() -> None:
+        t0 = time.monotonic()
+        while not done.wait(30.0):
+            _tqdm_write(f"  … {label} still running ({time.monotonic() - t0:.0f}s)")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    t.join()
+    if err:
+        raise err[0]
+    return out[0]
+
+
+def _is_timeout_like(err: BaseException) -> bool:
+    if isinstance(err, TimeoutError):
+        return True
+    name = type(err).__name__.lower()
+    if "timeout" in name:
+        return True
+    msg = str(err).lower()
+    return "timed out" in msg or "timeout" in msg
+
+
+def _nested_timeout_exc(exc: BaseException) -> BaseException | None:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if _is_timeout_like(cur):
+            return cur
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def openai_audit_response(
+    client: OpenAI,
+    image_path: Path,
+    config: AuditConfig,
+    rate_limiter: RateLimiter,
+) -> str:
+    """
+    Call OpenAI Responses API with the dashboard image; return response text.
+    Retries on 429/timeouts.
+    """
+    if not config.api_key:
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY. Set it in the environment before running."
+        )
+
+    raw_image, mime = _with_heartbeat(
+        "Image read (and resize if Pillow)",
+        lambda: _image_bytes_for_api(image_path),
+    )
+    image_url = _data_url_from_bytes(raw_image, mime)
+
+    backoff = INITIAL_BACKOFF_SEC
+    last_error: str | None = None
+    timeout_streak = 0
+
+    for attempt in range(MAX_RETRIES):
+        rate_limiter.wait()
+        if attempt > 0:
+            tail = (last_error or "")[:200]
+            _tqdm_write(f"  … retry {attempt + 1}/{MAX_RETRIES} (last: {tail})")
+
+        def _call() -> Any:
+            # Docs: Responses API accepts content parts with {"type":"input_text"} and {"type":"input_image","image_url":...}
+            kwargs: dict[str, Any] = {
+                "model": config.model,
+                "instructions": SYSTEM_PROMPT,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Audit this dashboard image and return ONLY the JSON."},
+                            {"type": "input_image", "image_url": image_url},
+                        ],
+                    }
+                ],
+                "max_output_tokens": config.max_output_tokens,
+                "timeout": float(config.http_timeout_sec),
+            }
+            # Some OpenAI models do not support sampling params (temperature/top_p). Only include when enabled.
+            if os.environ.get("OPENAI_ENABLE_SAMPLING", "").strip().lower() in {"1", "true", "yes", "y"}:
+                kwargs["temperature"] = config.temperature
+                kwargs["top_p"] = config.top_p
+
+            return client.responses.create(
+                **kwargs
+            )
+
+        try:
+            resp = _with_heartbeat(
+                f"OpenAI responses.create ({config.model})",
+                _call,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            nested = _nested_timeout_exc(exc)
+            if nested is not None:
+                timeout_streak += 1
+                _tqdm_write(
+                    f"  Request timed out after {config.http_timeout_sec:.0f}s "
+                    f"({timeout_streak}/{MAX_TIMEOUT_RETRIES}). "
+                    f"Set OPENAI_HTTP_TIMEOUT_SEC to wait longer."
+                )
+                if timeout_streak >= MAX_TIMEOUT_RETRIES:
+                    raise RuntimeError(
+                        f"OpenAI timed out {timeout_streak} times in a row "
+                        f"(timeout={config.http_timeout_sec:.0f}s). Increase OPENAI_HTTP_TIMEOUT_SEC "
+                        f"or reduce image size / OPENAI_MAX_OUTPUT_TOKENS."
+                    ) from exc
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 120.0)
+                continue
+
+            timeout_streak = 0
+            msg = str(exc).lower()
+            if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+                wait = min(max(backoff, 2.0), 120.0)
+                _tqdm_write(f"  Rate limited; sleeping {wait:.0f}s…")
+                time.sleep(wait)
+                backoff = min(backoff * 2, 300.0)
+                continue
+            raise RuntimeError(last_error) from exc
+
+        timeout_streak = 0
+        backoff = INITIAL_BACKOFF_SEC
+
+        text = getattr(resp, "output_text", None)
+        if isinstance(text, str):
+            text = text.strip()
+        else:
+            text = ""
+        if not text:
+            last_error = "Empty model response (no output_text)"
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120.0)
+            continue
+
+        return text
+
+    raise RuntimeError(
+        f"OpenAI request failed after {MAX_RETRIES} attempts. Last error: {last_error}"
+    )
+
+
+def _aggregate_compliant_from_runs(
+    successful_runs: list[dict[str, Any]],
+) -> tuple[bool | None, dict[str, Any]]:
+    votes_true = votes_false = votes_unclear = 0
+    for r in successful_runs:
+        c = r.get("compliant")
+        if c is True:
+            votes_true += 1
+        elif c is False:
+            votes_false += 1
+        else:
+            votes_unclear += 1
+    n_clear = votes_true + votes_false
+    meta: dict[str, Any] = {
+        "votes_true": votes_true,
+        "votes_false": votes_false,
+        "votes_unclear": votes_unclear,
+        "fraction_compliant": (votes_true / n_clear) if n_clear else None,
+    }
+    if n_clear == 0:
+        meta["decision"] = "no_clear_votes"
+        return None, meta
+    if votes_true > votes_false:
+        meta["decision"] = "majority_compliant"
+        return True, meta
+    if votes_false > votes_true:
+        meta["decision"] = "majority_non_compliant"
+        return False, meta
+    frac = votes_true / n_clear
+    meta["decision"] = "tie_break_mean"
+    return (frac >= 0.5), meta
+
+
+def _representative_audit_run(
+    successful_runs: list[dict[str, Any]],
+    compliant_decision: bool | None,
+) -> dict[str, Any]:
+    for r in successful_runs:
+        if compliant_decision is None or r.get("compliant") == compliant_decision:
+            return r
+    return successful_runs[0]
+
+
+def generate_audit_single(
+    image_path: Path,
+    config: AuditConfig,
+    rate_limiter: RateLimiter,
+    client: OpenAI,
+    *,
+    run_index: int = 0,
+    run_label: str = "",
+) -> dict[str, Any]:
+    size_mb = image_path.stat().st_size / (1024 * 1024)
+    try:
+        rel_name = str(image_path.relative_to(config.image_dir))
+    except ValueError:
+        rel_name = image_path.name
+    label = f" {run_label}" if run_label else ""
+    _tqdm_write(
+        f" Requesting audit{label}: {rel_name} ({size_mb:.2f} MiB on disk) — "
+        f"API timeout {config.http_timeout_sec:.0f}s. "
+        f"0% until this file finishes; you should see “still running” heartbeats during the request."
+    )
+    text = openai_audit_response(client, image_path, config, rate_limiter)
+
+    try:
+        result = parse_audit_json(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Model returned non-JSON (or truncated JSON): {exc}\n"
+            f"Preview: {text[:800]!r}"
+        ) from exc
+
+    result["filename"] = rel_name
+    result["openai_model"] = config.model
+    result["audit_run_index"] = run_index
+    if config.post_request_pause_sec > 0:
+        time.sleep(config.post_request_pause_sec)
+    return result
+
+
+def generate_audit(
+    image_path: Path,
+    config: AuditConfig,
+    rate_limiter: RateLimiter,
+    client: OpenAI,
+) -> dict[str, Any]:
+    n = config.audit_runs_per_image
+    audit_runs: list[dict[str, Any]] = []
+    for i in range(n):
+        run_cfg = replace(config, seed=config.seed + i)
+        try:
+            single = generate_audit_single(
+                image_path,
+                run_cfg,
+                rate_limiter,
+                client,
+                run_index=i,
+                run_label=f"({i + 1}/{n})",
+            )
+            audit_runs.append(single)
+        except Exception as exc:
+            audit_runs.append(
+                {
+                    "filename": image_path.name,
+                    "audit_run_index": i,
+                    "error": str(exc),
+                    "raw_error_type": type(exc).__name__,
+                }
+            )
+
+    ok = [r for r in audit_runs if "error" not in r]
+    if not ok:
+        return {
+            "filename": image_path.name,
+            "error": "All audit runs failed for this image.",
+            "raw_error_type": "AllRunsFailed",
+            "audit_runs": audit_runs,
+        }
+
+    compliant_decision, agg_meta = _aggregate_compliant_from_runs(ok)
+    rep = _representative_audit_run(ok, compliant_decision)
+
+    merged: dict[str, Any] = {
+        "filename": image_path.name,
+        "compliant": compliant_decision,
+        "noncompliance_score": rep.get("noncompliance_score"),
+        "rule_checks": rep.get("rule_checks"),
+        "compliant_aggregation": {
+            "runs_requested": n,
+            "runs_succeeded": len(ok),
+            "runs_failed": n - len(ok),
+            **agg_meta,
+        },
+        "violations": rep.get("violations"),
+        "charts_detected": rep.get("charts_detected"),
+        "final_explanation": rep.get("final_explanation"),
+        "openai_model": rep.get("openai_model"),
+        "audit_runs": audit_runs,
+    }
+    return merged
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_rule_key(rule: Any) -> str:
+    if not rule or not isinstance(rule, str):
+        return "unknown"
+    r = rule.strip()
+    if "|" in r:
+        r = r.split("|", maxsplit=1)[0].strip()
+    return r or "unknown"
+
+
+def write_compliance_charts(results: list[dict[str, Any]], output_path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    parsed = [r for r in results if "error" not in r]
+    failed = [r for r in results if "error" in r]
+    compliant_n = sum(1 for r in parsed if r.get("compliant") is True)
+    noncompliant_n = sum(1 for r in parsed if r.get("compliant") is False)
+    ambiguous_n = len(parsed) - compliant_n - noncompliant_n
+
+    rule_counts: Counter[str] = Counter()
+    confidences: list[float] = []
+    low_conf_violations = 0
+    chart_type_counts: Counter[str] = Counter()
+    starts_at_zero_counts: Counter[str] = Counter()
+
+    for r in parsed:
+        violations = r.get("violations")
+        if isinstance(violations, list):
+            for v in violations:
+                if not isinstance(v, dict):
+                    continue
+                rule_counts[_normalize_rule_key(v.get("rule"))] += 1
+                c = _safe_float(v.get("confidence"))
+                if c is not None:
+                    confidences.append(c)
+                if v.get("low_confidence") is True:
+                    low_conf_violations += 1
+
+        charts = r.get("charts_detected")
+        if isinstance(charts, list):
+            for ch in charts:
+                if not isinstance(ch, dict):
+                    continue
+                chart_type_counts[str(ch.get("type") or "unknown")] += 1
+                s = ch.get("starts_at_zero")
+                if s is True:
+                    starts_at_zero_counts["true"] += 1
+                elif s is False:
+                    starts_at_zero_counts["false"] += 1
+                else:
+                    starts_at_zero_counts["unknown"] += 1
+
+    # Optional evaluation metrics if labels are provided.
+    gt_path = Path(os.environ.get("OPENAI_GROUND_TRUTH", "./ibcs_ground_truth.csv"))
+    gt = _load_ground_truth(gt_path)
+    has_gt = bool(gt)
+
+    # Layout:
+    # - Without ground truth: 2x2 (compliance, violations by rule, confidence dist, chart types)
+    # - With ground truth: 3x2 (adds confusion matrix + PR curve + classification report)
+    if has_gt:
+        fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    fig.suptitle("IBCS audit — summary from model JSON", fontsize=14, fontweight="bold")
+
+    ax_c = axes[0, 0] if has_gt else axes[0, 0]
+    labels = ["Compliant", "Non-compliant", "Unclear / missing flag", "API / parse error"]
+    counts = [compliant_n, noncompliant_n, ambiguous_n, len(failed)]
+    colors = ["#41ab5d", "#cb181d", "#fdae61", "#969696"]
+    if sum(counts) > 0:
+        x = range(len(labels))
+        ax_c.bar(x, counts, color=colors, edgecolor="white", linewidth=0.5)
+        ax_c.set_xticks(list(x))
+        ax_c.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+        ax_c.set_ylabel("Dashboards")
+        ax_c.set_title("Compliance outcome (by file)")
+        for i, v in enumerate(counts):
+            if v > 0:
+                ax_c.text(i, v, str(v), ha="center", va="bottom", fontsize=10)
+    else:
+        ax_c.set_axis_off()
+
+    ax_r = axes[0, 1] if has_gt else axes[0, 1]
+    if rule_counts:
+        items = rule_counts.most_common()
+        rules = [k[:32] + ("…" if len(k) > 32 else "") for k, _ in items]
+        vals = [v for _, v in items]
+        y_pos = range(len(rules))
+        ax_r.barh(list(y_pos), vals, color="#8856a7", edgecolor="white", linewidth=0.5)
+        ax_r.set_yticks(list(y_pos))
+        ax_r.set_yticklabels(rules, fontsize=8)
+        ax_r.invert_yaxis()
+        ax_r.set_xlabel("Violation count")
+        ax_r.set_title("Violations by rule field")
+    else:
+        ax_r.text(0.5, 0.5, "No violations in JSON", ha="center", va="center")
+        ax_r.set_axis_off()
+
+    # Remove the "charts_detected entries per file" plot (not useful for evaluation).
+    # Replace with chart type distribution (when no GT) OR confusion matrix (when GT exists).
+    if has_gt:
+        ax_d = axes[1, 0]
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        y_score: list[float] = []
+        for r in parsed:
+            fn = str(r.get("filename", ""))
+            if not fn or fn not in gt:
+                continue
+            pred_c = r.get("compliant")
+            if pred_c not in (True, False):
+                continue
+            true_c = gt[fn]
+            y_true.append(0 if true_c else 1)  # 1 = non-compliant
+            y_pred.append(0 if pred_c else 1)
+            s = _safe_float(r.get("noncompliance_score"))
+            if s is None:
+                # fallback: max violation confidence
+                max_v = 0.0
+                vs = r.get("violations")
+                if isinstance(vs, list):
+                    for v in vs:
+                        if isinstance(v, dict):
+                            c = _safe_float(v.get("confidence"))
+                            if c is not None:
+                                max_v = max(max_v, c)
+                s = max_v
+            y_score.append(float(min(max(s, 0.0), 1.0)))
+
+        if y_true:
+            cm = _confusion_matrix(y_true, y_pred)
+            # Plot as a 2x2 heatmap-like grid.
+            mat = [[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]]
+            ax_d.imshow(mat, cmap="Blues")
+            ax_d.set_xticks([0, 1])
+            ax_d.set_yticks([0, 1])
+            ax_d.set_xticklabels(["Pred C", "Pred NC"])
+            ax_d.set_yticklabels(["True C", "True NC"])
+            ax_d.set_title("Confusion matrix (NC=positive)")
+            for (i, j), val in [((0, 0), mat[0][0]), ((0, 1), mat[0][1]), ((1, 0), mat[1][0]), ((1, 1), mat[1][1])]:
+                ax_d.text(j, i, str(val), ha="center", va="center", color="#111", fontsize=11)
+        else:
+            ax_d.text(
+                0.5,
+                0.5,
+                f"No matching ground-truth labels found.\nSet `OPENAI_GROUND_TRUTH` to a CSV/JSON with filenames.",
+                ha="center",
+                va="center",
+            )
+            ax_d.set_axis_off()
+    else:
+        ax_d = axes[1, 0]
+        if chart_type_counts:
+            types_ = list(chart_type_counts.keys())
+            vals = [chart_type_counts[t] for t in types_]
+            ax_d.bar(range(len(types_)), vals, color="#fdae61", edgecolor="white", linewidth=0.5)
+            ax_d.set_xticks(range(len(types_)))
+            ax_d.set_xticklabels([t[:20] for t in types_], rotation=25, ha="right", fontsize=8)
+            ax_d.set_ylabel("Count")
+            ax_d.set_title("Chart types (charts_detected.type)")
+        else:
+            ax_d.text(0.5, 0.5, "No chart types found", ha="center", va="center")
+            ax_d.set_axis_off()
+
+    ax_h = axes[1, 1] if has_gt else axes[1, 1]
+    if confidences:
+        ax_h.hist(confidences, bins=min(12, max(4, len(confidences))), color="#7fcdbb", edgecolor="white")
+        ax_h.set_xlabel("confidence (violations)")
+        ax_h.set_ylabel("Count")
+        ax_h.set_title("Distribution of violation confidence")
+        ax_h.axvline(0.6, color="#cb181d", linestyle="--", linewidth=1, label="0.6 threshold")
+        ax_h.legend(loc="upper right", fontsize=8)
+    else:
+        ax_h.text(0.5, 0.5, "No violation scores or chart types", ha="center", va="center")
+        ax_h.set_axis_off()
+
+    if has_gt:
+        ax_pr = axes[2, 0]
+        ax_txt = axes[2, 1]
+        if "y_true" in locals() and y_true:
+            precisions, recalls, auc_pr = _pr_curve(y_true, y_score)
+            ax_pr.plot(recalls, precisions, color="#2c7fb8", linewidth=2)
+            ax_pr.set_xlim(0, 1)
+            ax_pr.set_ylim(0, 1)
+            ax_pr.set_xlabel("Recall (non-compliant)")
+            ax_pr.set_ylabel("Precision (non-compliant)")
+            ax_pr.set_title(f"PR curve (AUC={auc_pr:.3f})")
+
+            cm = _confusion_matrix(y_true, y_pred)
+            rep = _classification_report(cm)
+            txt = (
+                f"Ground truth file: {gt_path.name}\n"
+                f"Evaluated: {len(y_true)} items (excluded unclear/missing)\n\n"
+                f"Accuracy: {rep['accuracy']:.3f}\n"
+                f"Precision (NC): {rep['precision_noncompliant']:.3f}\n"
+                f"Recall (NC): {rep['recall_noncompliant']:.3f}\n"
+                f"F1 (NC): {rep['f1_noncompliant']:.3f}\n\n"
+                f"CM: TP={cm['tp']} FP={cm['fp']} TN={cm['tn']} FN={cm['fn']}"
+            )
+            ax_txt.text(0.0, 1.0, txt, ha="left", va="top", family="monospace", fontsize=9)
+            ax_txt.set_axis_off()
+        else:
+            ax_pr.text(0.5, 0.5, "No GT matched to predictions", ha="center", va="center")
+            ax_pr.set_axis_off()
+            ax_txt.text(
+                0.0,
+                1.0,
+                "Provide labels to enable metrics.\n"
+                "CSV header: filename,label (label: compliant/noncompliant)\n"
+                "or JSON: {\"file.png\": true/false}\n"
+                "Set OPENAI_GROUND_TRUTH=path",
+                ha="left",
+                va="top",
+                family="monospace",
+                fontsize=9,
+            )
+            ax_txt.set_axis_off()
+
+    extra = (
+        f"Files: {len(results)} · Parsed: {len(parsed)} · "
+        f"Violation rows: {sum(rule_counts.values())} · "
+        f"low_confidence violations: {low_conf_violations} · "
+        f"starts_at_zero: {dict(starts_at_zero_counts)}"
+    )
+    fig.text(0.5, 0.02, extra, ha="center", fontsize=8, color="#333")
+
+    fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def audit_dashboards(config: AuditConfig) -> list[dict[str, Any]]:
+    set_reproducible_seed(config.seed)
+    image_paths = get_image_paths(config.image_dir)
+    rate_limiter = RateLimiter(
+        min_interval_sec=config.min_interval_sec,
+        max_requests_per_minute=config.max_requests_per_minute,
+    )
+
+    try:
+        import PIL  # noqa: F401
+
+        _pillow = True
+    except ImportError:
+        _pillow = False
+    resize_note = (
+        f"Image resize: max edge {IMAGE_MAX_EDGE}px (OPENAI_IMAGE_MAX_EDGE; needs Pillow)."
+        if _pillow and IMAGE_MAX_EDGE > 0
+        else (
+            "Install Pillow for faster runs: images are shrunk before request (see OPENAI_IMAGE_MAX_EDGE)."
+            if not _pillow and IMAGE_MAX_EDGE > 0
+            else "Image resize off (OPENAI_IMAGE_MAX_EDGE=0 or no Pillow)."
+        )
+    )
+
+    client = OpenAI(api_key=config.api_key)
+    pause_note = (
+        f", +{config.post_request_pause_sec:g}s after each success"
+        if config.post_request_pause_sec > 0
+        else ""
+    )
+    print(
+        f"Using OpenAI model {config.model!r} (set OPENAI_API_KEY). "
+        f"max_output_tokens={config.max_output_tokens}. "
+        f"HTTP timeout={config.http_timeout_sec:.0f}s. "
+        f"Client throttle: ≥{config.min_interval_sec:g}s between API calls, "
+        f"≤{config.max_requests_per_minute} RPM{pause_note}."
+    )
+    print(resize_note)
+    sys.stdout.flush()
+    print(
+        "Note: tqdm stays at 0% until the first image finishes; vision requests can take a while."
+    )
+    sys.stdout.flush()
+    print(
+        f"Found {len(image_paths)} image(s). "
+        f"{config.audit_runs_per_image} audit run(s) per image (OPENAI_AUDIT_RUNS). Starting audit..."
+    )
+    results: list[dict[str, Any]] = []
+
+    with tqdm(
+        image_paths,
+        desc="Auditing dashboards",
+        mininterval=0.5,
+        miniters=1,
+    ) as pbar:
+        for image_path in pbar:
+            try:
+                short = image_path.name[:44] + ("…" if len(image_path.name) > 44 else "")
+                pbar.set_postfix_str(short, refresh=True)
+                results.append(generate_audit(image_path, config, rate_limiter, client))
+            except Exception as exc:
+                print(f"\nError processing {image_path.name}: {exc}")
+                results.append(
+                    {
+                        "filename": image_path.name,
+                        "error": str(exc),
+                        "raw_error_type": type(exc).__name__,
+                    }
+                )
+
+    return results
+
+
+def save_results(results: list[dict[str, Any]], output_file: Path) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8") as file:
+        json.dump(results, file, indent=2, ensure_ascii=False)
+
+
+def main() -> None:
+    config = AuditConfig()
+    results = audit_dashboards(config)
+    save_results(results, config.output_file)
+    print(f"\nAudit complete. Report saved to: {config.output_file.resolve()}")
+    try:
+        write_compliance_charts(results, config.compliance_charts_file)
+        print(f"Compliance charts saved to: {config.compliance_charts_file.resolve()}")
+    except ImportError:
+        print(
+            "matplotlib is not installed; skipping compliance charts. "
+            "Install with: pip install matplotlib"
+        )
+
+
+if __name__ == "__main__":
+    main()
