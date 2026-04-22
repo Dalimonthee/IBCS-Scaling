@@ -80,19 +80,47 @@ General reading permissions:
 RULE DEFINITIONS (tight, non-overreaching)
 
 RULE axis_baseline:
-- Only applies when a quantitative axis is present OR when baseline is explicitly implied (e.g., y-axis with ticks, numeric scale, or clear baseline markers).
-- If there is NO visible quantitative axis (no ticks/scale), treat baseline as "unknown" (NOT a violation). Do not infer truncation from bar heights alone.
-- Violation only if you can clearly see a non-zero baseline/truncated axis AND it is not justified in the chart.
+- Only applies when you can clearly identify a quantitative axis (ticks + numeric labels) or an explicit scale.
+- Do NOT confuse decorative elements with axes:
+  - thin reference lines, “zero” midlines, gridlines without numeric tick labels, projection/guide lines (often blue), or bar “stems” are NOT axes by themselves.
+  - A real axis typically has tick marks and numeric labels aligned to a baseline/axis line.
+- If there is NO readable quantitative axis (no ticks/scale), set axis_baseline.status="unknown" (NOT a violation). Do not infer truncation from bar heights alone.
+- Violation only if you can clearly see a non-zero baseline/truncated axis (with readable scale) AND it is not justified in the chart.
 
 RULE consistent_scaling:
 - Only evaluate between charts that are truly comparable:
   - same metric + same unit (e.g., revenue USD vs revenue USD; margin % vs margin %), OR explicitly stated as directly comparable in titles/legend.
   - Do NOT treat percent (%) vs absolute values (USD, K, units) as requiring a shared scale.
   - Do NOT compare scales across charts that are different concepts even if they share a unit (e.g., Sales ΔPL% vs Cost ΔPL% are different business concepts; color semantics may differ).
-- Only flag a violation if:
-  - comparable charts have visible quantitative axes AND the axis ranges/intervals differ, OR
-  - the chart explicitly indicates a shared scale requirement but scales differ.
-- If axis information is not readable (blur/low-res), mark this rule as "unknown", not a violation.
+
+What "consistent scaling" MEANS (core idea):
+- For comparable bar/column charts, bars across charts must be drawn on the SAME numeric-to-height scale.
+- Think: if you take any bar from Chart A and place it onto Chart B, its height should match the value-to-height mapping in Chart B.
+- Therefore, ratios must hold across charts:
+  - If Chart A has a bar value 150 and Chart B has a bar value 300, then the 150-bar should be about HALF the height of the 300-bar (same baseline, same unit).
+  - If values are 100 vs 300, height should be about ONE THIRD.
+
+How to CHECK it (prefer strongest evidence first):
+1) If readable y-axes exist on the comparable charts:
+   - Compare axis ranges/intervals; they must match for comparable panels.
+   - Violation if axis ranges/intervals differ and the charts are intended to be comparable.
+2) If y-axes are NOT shown (hidden-axis small multiples / panels):
+   - You MUST switch to an explicit proportionality check using visible evidence, NOT “fills panel” heuristics.
+   - Do NOT decide scaling by whether bars touch the top/bottom of a panel or “use the whole space”. That is not evidence of scale differences.
+   - Instead, do a simple pixel-based projection:
+     - Identify 2–5 bars across the comparable charts that have clearly readable numeric value labels.
+     - For each selected bar, estimate its height in pixels (rough estimate is fine) from baseline to bar end.
+     - Compare ratios:
+       - value_ratio = value_A / value_B
+       - pixel_ratio = pixel_height_A / pixel_height_B
+     - If pixel_ratio approximately matches value_ratio (within ~10% relative tolerance), treat it as evidence of consistent scaling.
+   - PASS only if you can verify proportionality using this pixel-ratio method OR an explicit “same scale/max/min” statement exists.
+   - FAIL only if you can clearly verify mismatch using this method (e.g., value doubles but pixel height is not close to doubling).
+   - If you cannot obtain readable values OR cannot estimate bar heights due to blur/occlusion, set status="unknown" (do NOT fail).
+
+Important:
+- Do NOT infer different scales merely because panels lack axes. Hidden axes are common; use ratio evidence.
+- If axis info is not readable (blur/low-res), mark this rule as "unknown", not a violation.
 
 RULE zoom_requirement:
 - Only applies when the chart is intended for precise visual comparison AND differences are too small to read at the shown scale.
@@ -106,6 +134,7 @@ RULE labelling:
 - Do NOT require consistent placement/format across multiple charts.
 - It is NOT a violation if some values are inside and some are outside, as long as the key data are readable/understandable.
 - Violation only if numeric values are necessary to interpret the chart AND they are missing/illegible for the relevant marks.
+- Forecast/FC marks: treat forecast bars/marks as needing labels the same way as actual bars for interpretability (for now, assume labels are needed).
 
 Compliance decision:
 - A dashboard is non-compliant if ANY violation has confidence >= 0.6.
