@@ -79,6 +79,12 @@ General reading permissions:
 
 RULE DEFINITIONS (tight, non-overreaching)
 
+Chart type constraint (MANDATORY):
+- You must evaluate ALL charts you see (not just bar charts).
+- If you detect ANY pie chart OR gauge/speedometer chart anywhere on the dashboard, the dashboard is automatically NON-COMPLIANT.
+  - Record this as a violation with rule="labelling" (unsupported chart type) and confidence >= 0.9.
+  - Set rule_checks.labelling.status="fail" and explain which chart(s) were pie/gauge in evidence.
+
 RULE axis_baseline:
 - Only applies when you can clearly identify a quantitative axis (ticks + numeric labels) or an explicit scale.
 - Do NOT confuse decorative elements with axes:
@@ -87,41 +93,169 @@ RULE axis_baseline:
 - If there is NO readable quantitative axis (no ticks/scale), set axis_baseline.status="unknown" (NOT a violation). Do not infer truncation from bar heights alone.
 - Violation only if you can clearly see a non-zero baseline/truncated axis (with readable scale) AND it is not justified in the chart.
 
+BAR ORIENTATION — you MUST identify the correct baseline for each chart type:
+
+  STANDARD (upright) bar/column chart:
+    Bars grow UPWARD from the baseline. The baseline is at the BOTTOM of the bars.
+    Compliant baseline = 0 at the bottom. Violation = bottom axis starts at a non-zero value.
+
+  NEGATIVE / INVERTED bar chart (bars hang downward):
+    This occurs when all data values are negative (e.g., Cancellations MRR, Downgrades MRR).
+    Bars grow DOWNWARD from the baseline. The baseline is at the TOP of the chart area.
+    The correct baseline for negative charts is 0 at the TOP (e.g., "$0K" or "0" at the top).
+    Compliant = the axis reads 0 at the top and bars extend downward into negative territory.
+
+    HOW TO CHECK for a negative bar chart — read the TOP axis label:
+      - Look at the topmost numeric tick/label on the axis (highest position in the panel).
+      - If that label reads "0", "$0", or "$0K" → baseline is zero → PASS.
+      - If that label reads ANY negative value (e.g., "-$5K", "-$10K", "-10") → zero is
+        excluded from the chart entirely → this IS a violation of axis_baseline.
+        Do NOT assume zero is implied. If you cannot see a 0 label at the top, it is absent.
+      - If unreadable → status = "unknown".
+
+    Do NOT flag an inverted negative bar chart as a violation merely because the bottom of
+    the chart is a large negative number — that is correct behavior.
+    Do NOT assume the baseline is zero just because bars appear to start from the top edge
+    — always verify by reading the actual top axis label.
+
+  DIVERGING bar chart (bars go both up AND down from a central zero line):
+    The baseline is the central zero line. Both upward and downward bars must originate
+    from this zero line. Compliant = zero line is clearly present in the center.
+    Violation = the zero line is absent or the chart is cropped to exclude zero.
+
+  HORIZONTAL bar chart:
+    Bars grow LEFT or RIGHT from the baseline. The baseline is on the LEFT side (for
+    standard positive bars). Compliant = left axis starts at 0.
+    Violation = left axis starts at a non-zero value.
+
+  For ALL types: if the axis labels are unreadable or the chart type is ambiguous,
+  set axis_baseline.status = "unknown". Do NOT guess.
+
 RULE consistent_scaling:
-- Only evaluate between charts that are truly comparable:
-  - same metric + same unit (e.g., revenue USD vs revenue USD; margin % vs margin %), OR explicitly stated as directly comparable in titles/legend.
-  - Do NOT treat percent (%) vs absolute values (USD, K, units) as requiring a shared scale.
-  - Do NOT compare scales across charts that are different concepts even if they share a unit (e.g., Sales ΔPL% vs Cost ΔPL% are different business concepts; color semantics may differ).
+Comparable charts MUST share the same numeric-to-pixel scale. The presence or absence of a
+y-axis is irrelevant to this rule. What matters is whether the bars are drawn proportionally
+correctly relative to each other across comparable charts.
 
-What "consistent scaling" MEANS (core idea):
-- For comparable bar/column charts, bars across charts must be drawn on the SAME numeric-to-height scale.
-- Think: if you take any bar from Chart A and place it onto Chart B, its height should match the value-to-height mapping in Chart B.
-- Therefore, ratios must hold across charts:
-  - If Chart A has a bar value 150 and Chart B has a bar value 300, then the 150-bar should be about HALF the height of the 300-bar (same baseline, same unit).
-  - If values are 100 vs 300, height should be about ONE THIRD.
+COMPARABILITY (evaluate first — think carefully and deeply):
+- Charts are comparable if they share the same unit AND are meaningfully related in
+  business context such that a reader would want to compare their magnitudes directly.
+- You MUST reason about the semantic meaning of each chart’s title and subject, not
+  just surface-level metric names. Apply the following thinking steps:
 
-How to CHECK it (prefer strongest evidence first):
-1) If readable y-axes exist on the comparable charts:
-   - Compare axis ranges/intervals; they must match for comparable panels.
-   - Violation if axis ranges/intervals differ and the charts are intended to be comparable.
-2) If y-axes are NOT shown (hidden-axis small multiples / panels):
-   - You MUST switch to an explicit proportionality check using visible evidence, NOT “fills panel” heuristics.
-   - Do NOT decide scaling by whether bars touch the top/bottom of a panel or “use the whole space”. That is not evidence of scale differences.
-   - Instead, do a simple pixel-based projection:
-     - Identify 2–5 bars across the comparable charts that have clearly readable numeric value labels.
-     - For each selected bar, estimate its height in pixels (rough estimate is fine) from baseline to bar end.
-     - Compare ratios:
-       - value_ratio = value_A / value_B
-       - pixel_ratio = pixel_height_A / pixel_height_B
-     - If pixel_ratio approximately matches value_ratio (within ~10% relative tolerance), treat it as evidence of consistent scaling.
-   - PASS only if you can verify proportionality using this pixel-ratio method OR an explicit “same scale/max/min” statement exists.
-   - FAIL only if you can clearly verify mismatch using this method (e.g., value doubles but pixel height is not close to doubling).
-   - If you cannot obtain readable values OR cannot estimate bar heights due to blur/occlusion, set status="unknown" (do NOT fail).
+  THINKING STEP 1 — Unit match:
+    Do the charts share the same unit? (e.g., both in USD, both in count of people,
+    both in %, both in K revenue). If units differ → not comparable, stop.
 
-Important:
-- Do NOT infer different scales merely because panels lack axes. Hidden axes are common; use ratio evidence.
-- If axis info is not readable (blur/low-res), mark this rule as "unknown", not a violation.
+  THINKING STEP 2 — Semantic relationship:
+    Even if metric names differ, ask: are these charts measuring related quantities
+    that belong to the same conceptual space?
+    Examples of comparable groups despite different names:
+      • “New Visitors”, “New Leads”, “New Customers”, “Customers” — all count people
+        at different funnel stages. Same unit (people), same conceptual domain
+        (customer acquisition funnel). Comparable.
+      • “Upgrades MRR”, “Downgrades MRR”, “New subscribers MRR”, “Cancellations MRR”,
+        “Reactivations MRR” — all measure revenue change components in the same currency.
+        Same unit ($), same conceptual domain (MRR movement). Comparable.
+      • “Revenue by Region A” and “Revenue by Region B” — same metric, comparable.
+    Examples NOT comparable:
+      • “Revenue (USD)” vs “Headcount (people)” — different units entirely.
+      • “Growth %” vs “Absolute value” — different unit types.
+      • “CAC (cost per customer)” vs “ARPU (revenue per user)” — both in USD but
+        measure fundamentally different things with incompatible scales.
 
+  THINKING STEP 3 — Dashboard intent:
+    Does the dashboard layout or title suggest these charts are meant to be compared
+    together? A dashboard called “MRR Breakdown” implies all MRR components are
+    meant to be read together. A funnel dashboard implies funnel stages are related.
+
+  THINKING STEP 4 — Decision:
+    If unit matches AND charts are semantically related AND dashboard intent supports
+    comparison → charts ARE comparable. Apply consistent scaling check.
+    If any step fails → not comparable, set status = "not_applicable".
+
+  MANDATORY: You MUST write your comparability reasoning explicitly into the evidence
+  field of consistent_scaling, even if the result is "not_applicable". Do not skip
+  this reasoning silently. Write which thinking step caused you to stop, and why.
+  Example evidence: "THINKING STEP 2: New Visitors, New Leads, New Customers, Customers
+  all count people at funnel stages — same unit (people), same domain. Comparable.
+  Proceeding to pixel-ratio check."
+
+- Do NOT treat % vs absolute values as requiring a shared scale.
+- If charts are NOT comparable → set status = "not_applicable". Stop.
+
+WHAT CONSISTENT SCALING MEANS:
+- If chart A has a bar with value 300 and chart B has a bar with value 150 (same metric,
+  same unit, same baseline of 0), then the 300-bar must be drawn TWICE as tall as the
+  150-bar in absolute pixel height — regardless of what panel they sit in, regardless
+  of panel size, and regardless of whether axes are shown.
+- A violation exists when comparable bars are drawn at pixel heights that do NOT match
+  their value ratios. For example: a 300 bar and a 150 bar drawn at the same pixel height
+  is a clear violation. A 300 bar drawn only slightly taller than a 150 bar is a violation.
+
+HOW TO CHECK — pixel-ratio method using only data labels:
+  Step 1: Identify 3–5 individual bars across the comparable charts that have clearly
+    readable numeric value labels directly on or above them.
+    Choose bars with a wide spread of values for sensitivity (e.g., a small value bar
+    and a large value bar from different panels).
+
+  Step 2: For each selected bar, find its TRUE pixel height from baseline to true bar top.
+    Baseline = the zero line shared across all comparable charts (the common ground).
+    True bar top detection (mandatory — do not skip):
+      a) Find the highest point of the bar’s fill color as the candidate top.
+      b) Check immediately at/above for any annotation in a DIFFERENT color
+         (arrows, brackets, callout lines, delta markers).
+      c) If the SAME fill color continues above the annotation → annotation is decorative,
+         placed on the bar. True top is higher. Keep scanning until fill genuinely ends.
+      d) If fill stops and only background is above → bar top confirmed.
+      e) Different fill color above → stacked bar; treat segments separately.
+
+  Step 3: For each pair of selected bars (bar_i, bar_j):
+      value_ratio = value_i / value_j
+      pixel_ratio = pixel_height_i / pixel_height_j
+    If pixel_ratio ≈ value_ratio (within 20% relative tolerance) → consistent for this pair.
+    If pixel_ratio clearly diverges from value_ratio (>20% off) → violation for this pair.
+
+  Step 4: Verdict:
+    - If ALL checked pairs are consistent → status = "pass".
+    - If ANY pair clearly violates → status = "fail", report the specific bars and ratios.
+    - If bars are unreadable/occluded/blurry → status = "unknown". Do NOT fail.
+
+LOW RESOLUTION / SMALL IMAGE HANDLING:
+  If the image is small, compressed, or low resolution such that individual bar pixel
+  heights cannot be reliably estimated, apply this threshold test:
+    Ask yourself: "Can I clearly distinguish the pixel height difference between a bar
+    worth 100 and a bar worth 200 in this image?" If NO → resolution is insufficient.
+  Indicators of insufficient resolution:
+    - The entire chart panel is smaller than roughly 150×120 pixels in the image.
+    - Bar labels are present but the bar bodies themselves are too thin to measure.
+    - The image appears heavily compressed, blurry, or is a screenshot of a screenshot.
+    - Charts are thumbnail-sized within a larger dashboard overview image.
+  If resolution is insufficient:
+    → IMMEDIATELY set consistent_scaling.status = "unknown".
+    → Do NOT attempt any pixel-ratio estimation at all.
+    → Write in evidence: "Image resolution too low for reliable pixel-ratio measurement.
+      Chart panels are too small to distinguish bar heights accurately."
+    → This is NOT a violation.
+  If SOME charts are readable and others are not:
+    → Evaluate only the readable ones.
+    → Skip unreadable charts and note them in evidence.
+  IMPORTANT: "unknown" due to resolution is always preferable to a false violation.
+  Never fail consistent_scaling solely because bar heights are hard to read.
+
+███ FORBIDDEN REASONING — these are NEVER valid as evidence ███
+  ✘ Comparing how tall a bar looks RELATIVE TO ITS OWN PANEL BOUNDARY or panel height.
+     ("This bar fills 80% of its panel" or "this bar nearly reaches the top of the panel"
+     — panel size is irrelevant and must never be used.)
+  ✘ Saying a panel is "larger" or "smaller" and using that as scaling evidence.
+  ✘ Comparing bar height to panel height in ANY way.
+  ✘ Using the highest labeled value in a panel as a proxy for the panel’s axis maximum.
+     (Data labels are values on bars, not axis maxima.)
+The ONLY valid pixel comparison is: bar_i pixel height vs bar_j pixel height measured
+from the SAME shared zero baseline, using confirmed true bar tops.
+
+Default: If you cannot perform the pixel-ratio check reliably → status = "unknown".
+Only FAIL when you can explicitly state: bar_i (value X, pixel height P) vs bar_j
+(value Y, pixel height Q), and P/Q diverges from X/Y by more than 20%.
 RULE zoom_requirement:
 - Only applies when the chart is intended for precise visual comparison AND differences are too small to read at the shown scale.
 - Distinguish:
@@ -130,11 +264,13 @@ RULE zoom_requirement:
 - Do NOT flag zoom_requirement if a zoomed-in panel/inset/callout is already present.
 
 RULE labelling:
-- This check is ONLY about whether the chart provides adequate numeric labeling for interpretation (values may be inside, above, or as callouts).
-- Do NOT require consistent placement/format across multiple charts.
-- It is NOT a violation if some values are inside and some are outside, as long as the key data are readable/understandable.
-- Violation only if numeric values are necessary to interpret the chart AND they are missing/illegible for the relevant marks.
-- Forecast/FC marks: treat forecast bars/marks as needing labels the same way as actual bars for interpretability (for now, assume labels are needed).
+- This check is about whether each chart provides adequate numeric labeling for interpretation.
+- Rule for bar/column charts (STRICT):
+  - If a chart has NO readable y-axis with numeric ticks, then per-bar numeric labels are REQUIRED for the relevant bars (including forecast/FC bars).
+  - Totals, deltas, or callouts at the top of the panel are NOT a substitute for per-bar labels when there is no y-axis.
+  - If a readable y-axis with numeric ticks IS present, per-bar labels are optional (axis can serve as the quantitative reference).
+- Do NOT require consistent placement/format across multiple charts (inside vs above vs callouts is fine).
+- Violation only when labels are required by the rule above AND are missing/illegible for the relevant marks.
 
 Compliance decision:
 - A dashboard is non-compliant if ANY violation has confidence >= 0.6.
